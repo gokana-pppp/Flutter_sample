@@ -1,6 +1,6 @@
 # my_calculator
 
-A new Flutter project.
+A new Flutter project.　（Flutter学習用にテストで作りました）
 
 ## Getting Started
 
