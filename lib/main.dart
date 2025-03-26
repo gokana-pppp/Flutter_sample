@@ -6,27 +6,64 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter_todo_sdk/flutter_todo_sdk.dart';
 
-void main() {
-  runApp(const MyApp());
+import 'package:amplify_flutter/amplify_flutter.dart';
+import 'package:amplify_auth_cognito/amplify_auth_cognito.dart';
+import 'package:amplify_authenticator/amplify_authenticator.dart';
+import 'amplify_outputs.dart'; //もしかしたらいらんかも
+import 'package:amplify_storage_s3/amplify_storage_s3.dart';
+import 'dart:io';
+import 'package:flutter/foundation.dart';
+
+// アプリの実行前にflutterとamplifyの初期化を行う
+void main() async {
+  // Flutterの初期化
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    //  Amplify SDKの初期化と設定を行う関数を呼び出し
+    await _configureAmplify();
+    // アプリの実行
+    runApp(const MyApp());
+  } on AmplifyException catch (e) {
+    runApp(Text("Error configuring Amplify: ${e.message}"));
+  }
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '数字計算アプリ',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.yellow,
-          brightness: Brightness.light,
+    // 認証UI、状態管理、セキュリティチェック、S3アップロード時の認証トークン管理を自動で行うためAuthenticatorを使用
+    return Authenticator(
+      child: MaterialApp(
+        title: '数字計算アプリ',
+        theme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: Colors.yellow,
+            brightness: Brightness.light,
+          ),
+          useMaterial3: true,
         ),
-        useMaterial3: true,
+        home: const HelloWorldPage(title: 'トップ画面'),
       ),
-      home: const HelloWorldPage(title: 'トップ画面'),
     );
+  }
+}
+
+// アプリがAWS Amplifyサービス（認証・ストレージなど）を使用するために必要な設定を行う関数
+Future<void> _configureAmplify() async {
+  try {
+    // 認証プラグインの初期化 
+    final auth = AmplifyAuthCognito();
+    await Amplify.addPlugin(auth);
+    // ストレージプラグインの初期化
+    await Amplify.addPlugin(AmplifyStorageS3());
+    // amplify_outputs.dartで定義した設定をAmplifyに適用
+    await Amplify.configure(jsonEncode(amplifyConfig));
+    safePrint('Successfully configured Amplify');
+  } on Exception catch (e) {
+    safePrint('Error configuring Amplify: $e');
+    rethrow;
   }
 }
 
@@ -137,27 +174,79 @@ class HelloWorldPage extends StatelessWidget {
     }
   }
 
+  // 
   Future<void> _openCamera(BuildContext context) async {
     final ImagePicker picker = ImagePicker();
     try {
-      final XFile? photo = await picker.pickImage(source: ImageSource.camera);
-      if (photo != null) {
+      // ユーザーにカメラか写真ライブラリを選択させる
+      final XFile? imageFile = await showDialog<XFile?>(
+        context: context,
+        builder: (BuildContext context) {
+          return AlertDialog(
+            title: const Text('画像を選択'),
+            content: const Text('画像をカメラで撮影するか、ライブラリから選択してください'),
+            actions: <Widget>[
+              TextButton.icon(
+                icon: const Icon(Icons.camera_alt),
+                label: const Text('カメラで撮影'),
+                onPressed: () async {
+                  Navigator.of(context).pop(
+                    await picker.pickImage(source: ImageSource.camera),
+                  );
+                },
+              ),
+              TextButton.icon(
+                icon: const Icon(Icons.photo_library),
+                label: const Text('写真を選択'),
+                onPressed: () async {
+                  Navigator.of(context).pop(
+                    await picker.pickImage(source: ImageSource.gallery),
+                  );
+                },
+              ),
+            ],
+          );
+        },
+      );
+
+      if (imageFile != null) {
         if (!context.mounted) return;
-        showDialog(
+        // ユーザーに選択または撮影された画像をアップロードするか確認する
+        final shouldUpload = await showDialog<bool>(
           context: context,
           builder: (BuildContext context) {
             return AlertDialog(
-              title: const Text('撮影完了'),
-              content: const Text('写真を撮影しました'),
+              title: const Text('画像のアップロード'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Image.file(
+                    File(imageFile.path),
+                    height: 200,
+                    width: 200,
+                    fit: BoxFit.cover,
+                  ),
+                  const SizedBox(height: 16),
+                  const Text('この画像をS3にアップロードしますか？'),
+                ],
+              ),
               actions: <Widget>[
                 TextButton(
-                  child: const Text('OK'),
-                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('キャンセル'),
+                  onPressed: () => Navigator.of(context).pop(false),
+                ),
+                TextButton(
+                  child: const Text('アップロード'),
+                  onPressed: () => Navigator.of(context).pop(true),
                 ),
               ],
             );
           },
-        );
+        ) ?? false;
+
+        if (shouldUpload && context.mounted) {
+          await _uploadImageToS3(context, imageFile);
+        }
       }
     } catch (e) {
       if (!context.mounted) return;
@@ -166,7 +255,7 @@ class HelloWorldPage extends StatelessWidget {
         builder: (BuildContext context) {
           return AlertDialog(
             title: const Text('エラー'),
-            content: const Text('カメラを使用できません。実機で試してください。'),
+            content: const Text('画像の取得に失敗しました。端末のカメラ/写真へのアクセス権限を確認してください。'),
             actions: <Widget>[
               TextButton(
                 child: const Text('OK'),
@@ -179,6 +268,271 @@ class HelloWorldPage extends StatelessWidget {
     }
   }
 
+  // 選択した画像をS3にアップロードする関数
+  Future<void> _uploadImageToS3(BuildContext context, XFile imageFile) async {
+    try {
+      safePrint('画像アップロード開始: ${imageFile.path}');
+      
+      // 一意のファイル名をタイムスタンプとランダム文字で生成
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final randomStr = Random().nextInt(10000).toString().padLeft(4, '0');
+      final extension = imageFile.path.split('.').last;
+      final path = 'user_images/image_${timestamp}_${randomStr}.$extension';
+      
+      // S3にアップロード
+      final result = await Amplify.Storage.uploadFile(
+        localFile: AWSFile.fromPath(imageFile.path),
+        path: StoragePath.fromString(path),
+        options: const StorageUploadFileOptions(),
+      ).result;
+      
+      safePrint('アップロード成功: ${result.uploadedItem.path}');
+      
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('アップロード成功: $path')),
+      );
+    } catch (e) {
+      safePrint('アップロードエラー: $e');
+      if (!context.mounted) return;
+      
+      String errorMessage = 'アップロードに失敗しました';
+      String detailMessage = e.toString();
+      
+      // 権限エラーの場合は具体的なメッセージを表示
+      if (e.toString().contains('AccessDenied') || 
+          e.toString().contains('access denied') ||
+          e.toString().contains('StorageAccessDeniedException')) {
+        errorMessage = 'S3へのアクセス権限がありません';
+        detailMessage = 'AWS Amplifyの設定で正しい権限が付与されているか確認してください。';
+      }
+      
+      showDialog(
+        context: context,
+        builder: (BuildContext context) {
+          return AlertDialog(
+            title: Text(errorMessage),
+            content: SingleChildScrollView(
+              child: Text(detailMessage),
+            ),
+            actions: <Widget>[
+              TextButton(
+                child: const Text('OK'),
+                onPressed: () => Navigator.of(context).pop(),
+              ),
+            ],
+          );
+        },
+      );
+    }
+  }
+
+  // アップロードボタンのイベントハンドラー
+  Future<void> _uploadTestImage(BuildContext context) async {
+    try {
+      _openCamera(context);
+    } catch (e) {
+      safePrint('アップロードエラー: $e');
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('エラー: $e')),
+      );
+    }
+  }
+
+// サインアップ
+  Future<void> _signUp(BuildContext context) async {
+    try {
+      final username = 'm.kurata+test@visk.co.jp';
+      final password = 'Password123!';
+      
+      safePrint('サインアップ試行中...');
+      safePrint('ユーザー名: $username');
+      
+      final result = await Amplify.Auth.signUp(
+        username: username,
+        password: password,
+        options: SignUpOptions(
+          userAttributes: {
+            AuthUserAttributeKey.email: 'm.kurata+test@visk.co.jp',
+          },
+        ),
+      );
+      
+      safePrint('サインアップ結果:');
+      safePrint('- isSignUpComplete: ${result.isSignUpComplete}');
+      safePrint('- userId: ${result.userId}');
+      safePrint('- nextStep: ${result.nextStep.signUpStep}');
+      
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('サインアップ処理完了（詳細はログを確認してください）')),
+      );
+    } catch (e) {
+      safePrint('サインアップエラー: $e');
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('サインアップエラー: $e')),
+      );
+    }
+  }
+
+// サインイン
+  Future<void> _signIn(BuildContext context) async {
+    try {
+      final username = 'm.kurata+test@visk.co.jp';
+      final password = 'Password123!';
+      
+      safePrint('サインイン試行中...');
+      safePrint('ユーザー名: $username');
+      
+      // cognitoへアクセス
+      final result = await Amplify.Auth.signIn(
+        username: username,
+        password: password,
+        options: const SignInOptions(),
+      );
+      
+      safePrint('サインイン結果:');
+      safePrint('- isSignedIn: ${result.isSignedIn}');
+      
+      // 次のステップに応じた処理
+      if (result.nextStep.signInStep == AuthSignInStep.confirmSignInWithNewPassword) {
+        safePrint('新しいパスワードでの確認が必要です');
+        // 必要に応じて新しいパスワードの確認処理を実装
+      } else if (result.nextStep.signInStep == AuthSignInStep.confirmSignUp) {
+        safePrint('サインアップの確認が必要です。確認コードを入力してください。');
+        // 確認コードの入力処理
+        await _confirmSignUp(context, username);
+      } else if (result.nextStep.signInStep == AuthSignInStep.resetPassword) {
+        safePrint('パスワードのリセットが必要です');
+        // パスワードリセット処理
+      } else if (result.nextStep.signInStep == AuthSignInStep.done) {
+        safePrint('サインイン成功！');
+      }
+      
+      if (result.isSignedIn) {
+        safePrint('サインイン成功！');
+        // 現在の認証状態を取得
+        final session = await Amplify.Auth.fetchAuthSession();
+        safePrint('認証セッション情報:');
+        safePrint('- isSignedIn: ${session.isSignedIn}');
+        safePrint('- session type: ${session.runtimeType}');
+        
+        // Cognitoセッション情報を取得
+        if (session is CognitoAuthSession) {
+          safePrint('- Cognitoセッション: 有効');
+          
+          try {
+            // 利用可能なセッション情報を表示
+            safePrint('- セッション詳細:');
+            
+            // isSignedInとruntimeTypeは基本的なプロパティなので安全にアクセス可能
+            safePrint('  - isSignedIn: ${session.isSignedIn}');
+            
+            // Amplify Debug情報
+            safePrint('  - デバッグ情報:');
+            // セッションオブジェクトをdumpして中身を確認
+            safePrint('  - オブジェクト型: ${session.runtimeType}');
+            safePrint('  - 利用可能なメソッド: ${session.toString()}');
+            
+          } catch (e) {
+            safePrint('セッション詳細取得エラー: $e');
+          }
+        }
+      }
+      
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('サインイン処理完了（詳細はログを確認してください）')),
+      );
+    } catch (e) {
+      safePrint('サインインエラー: $e');
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('サインインエラー: $e')),
+      );
+    }
+  }
+
+  Future<void> _confirmSignUp(BuildContext context, String username) async {
+    try {
+      // ダイアログを表示して確認コードを入力
+      String? confirmationCode = await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext context) {
+          final TextEditingController codeController = TextEditingController();
+          return AlertDialog(
+            title: const Text('確認コード入力'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('メールに送信された確認コードを入力してください'),
+                TextField(
+                  controller: codeController,
+                  decoration: const InputDecoration(
+                    labelText: '確認コード',
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                child: const Text('確認'),
+                onPressed: () {
+                  Navigator.of(context).pop(codeController.text);
+                },
+              ),
+            ],
+          );
+        },
+      );
+      
+      if (confirmationCode != null && confirmationCode.isNotEmpty) {
+        safePrint('確認コード送信中: $confirmationCode');
+        final result = await Amplify.Auth.confirmSignUp(
+          username: username,
+          confirmationCode: confirmationCode,
+        );
+        
+        safePrint('確認結果: ${result.isSignUpComplete}');
+        if (result.isSignUpComplete) {
+          // 確認完了後、再度サインインを試みる
+          await _signIn(context);
+        }
+      }
+    } catch (e) {
+      safePrint('確認エラー: $e');
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('確認エラー: $e')),
+      );
+    }
+  }
+
+  Future<void> _signOut(BuildContext context) async {
+    try {
+      safePrint('サインアウト試行中...');
+      await Amplify.Auth.signOut();
+      safePrint('サインアウト成功');
+      
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('サインアウト処理完了（詳細はログを確認してください）')),
+      );
+    } catch (e) {
+      safePrint('サインアウトエラー: $e');
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('サインアウトエラー: $e')),
+      );
+    }
+  }
+
+
+// 画面に描画されているボタン群
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -190,6 +544,21 @@ class HelloWorldPage extends StatelessWidget {
             const Text(
               "HelloWorld",
               style: TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () => _signUp(context),
+              child: const Text('サインアップ'),
+            ),
+            const SizedBox(height: 10),
+            ElevatedButton(
+              onPressed: () => _signIn(context),
+              child: const Text('サインイン'),
+            ),
+            const SizedBox(height: 10),
+            ElevatedButton(
+              onPressed: () => _signOut(context),
+              child: const Text('サインアウト'),
             ),
             const SizedBox(height: 20),
             ElevatedButton(
@@ -226,6 +595,12 @@ class HelloWorldPage extends StatelessWidget {
               onPressed: () => _openCamera(context),
               icon: const Icon(Icons.camera_alt),
               label: const Text('カメラを開く'),
+            ),
+            const SizedBox(height: 20),
+            ElevatedButton.icon(
+              onPressed: () => _uploadTestImage(context),
+              icon: const Icon(Icons.cloud_upload),
+              label: const Text('テスト画像をアップロード'),
             ),
           ],
         ),
@@ -429,5 +804,26 @@ class _TodoPageState extends State<TodoPage> {
   void dispose() {
     _textController.dispose();
     super.dispose();
+  }
+}
+
+Future<void> uploadFile(File file) async {
+  // Web環境ではこの関数を使用しない
+  if (kIsWeb) {
+    print('Web環境ではこの関数はサポートされていません');
+    return;
+  }
+
+  try {
+    final path = 'test_file_${DateTime.now().millisecondsSinceEpoch}.txt';
+    // ネイティブプラットフォーム用のコード
+    final result = await Amplify.Storage.uploadFile(
+      localFile: AWSFile.fromPath(file.path),
+      path: StoragePath.fromString(path),
+      options: const StorageUploadFileOptions(),
+    ).result;
+    print('アップロード成功: $path');
+  } catch (e) {
+    print('アップロードエラー: $e');
   }
 }
